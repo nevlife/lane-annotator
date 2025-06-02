@@ -1,283 +1,289 @@
 #!/usr/bin/env python3
-import sys
-import rospy
+import os
 import cv2
 import numpy as np
 import math
-from cv_bridge import CvBridge, CvBridgeError
-from morai_msgs.msg import CtrlCmd
-from sensor_msgs.msg import Image
-from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool
-from std_msgs.msg import Float32
-import time
-from PyQt5.QtWidgets import QWidget, QLabel, QApplication, QMainWindow
-from PyQt5.QtCore import QThread, Qt, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QImage, QPixmap
 
-# 분리한 차선 검출 알고리즘 임포트
-from lane_detection import LaneDetection
+def get_rgb_thresh_img(img, channel='R', thresh=(0, 255)):
+    """RGB 색상 공간에서 특정 채널에 대한 이진화 이미지 생성"""
+    img1 = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if channel == 'R':
+        bin_img = img1[:, :, 0]
+    elif channel == 'G':
+        bin_img = img1[:, :, 1]
+    elif channel == 'B':
+        bin_img = img1[:, :, 2]
 
-class pidController:
-    def __init__(self, p=1.0, i=1.0, d=1.0, rate=30):
-        self.p_gain = p
-        self.i_gain = i
-        self.d_gain = d
-        self.controlTime = 1/rate
-        self.prev_error = 0
-        self.i_control = 0
+    binary_img = np.zeros_like(bin_img).astype(np.uint8)
+    binary_img[(bin_img >= thresh[0]) & (bin_img < thresh[1])] = 1
 
-    def pid(self, target_vel, current_vel):
-        error = target_vel - current_vel.x
+    return binary_img
 
-        p_control = self.p_gain * error
-        self.i_control += self.i_gain * error
-        d_control = self.d_gain * (error - self.prev_error)
+def get_lab_bthresh_img(img, thresh=(0, 255)):
+    """LAB 색상 공간에서 B 채널에 대한 이진화 이미지 생성"""
+    lab_img = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    B = lab_img[:, :, 2]
+
+    bin_op = np.zeros_like(B).astype(np.uint8)
+    bin_op[(B >= thresh[0]) & (B < thresh[1])] = 1
+
+    return bin_op
+
+def get_hls_sthresh_img(img, thresh=(0, 255)):
+    """HLS 색상 공간에서 채도(S) 채널에 대한 이진화 이미지 생성"""
+    hls_img = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
+    S = hls_img[:, :, 2]
+
+    binary_output = np.zeros_like(S).astype(np.uint8)
+    binary_output[(S >= thresh[0]) & (S < thresh[1])] = 1
+
+    return binary_output
+
+def get_bin_img(img, kernel_size=5, sobel_thresh=(30, 200), 
+                r_thresh=(170, 255), s_thresh=(120, 255), 
+                b_thresh=(200, 255), g_thresh=(220, 255)):
+    """여러 색상 공간과 소벨 필터를 조합하여 이진화 이미지 생성"""
+    # 그레이스케일 변환
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 소벨 필터 적용
+    sobel = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=kernel_size)
+    abs_sobel = np.absolute(sobel)
+    scaled_sobel = np.uint8(255 * abs_sobel / np.max(abs_sobel))
+
+    # 소벨 이진화
+    sbinary = np.zeros_like(scaled_sobel)
+    sbinary[(scaled_sobel >= sobel_thresh[0]) & (scaled_sobel <= sobel_thresh[1])] = 1
+
+    # 각 색상 채널별 이진화
+    r_binary = get_rgb_thresh_img(img, thresh=r_thresh)
+    g_binary = get_rgb_thresh_img(img, channel='G', thresh=g_thresh)
+    b_binary = get_lab_bthresh_img(img, thresh=b_thresh)
+    s_binary = get_hls_sthresh_img(img, thresh=s_thresh)
+
+    # 모든 채널 조합
+    combined_binary = np.zeros_like(sbinary)
+    combined_binary255 = np.zeros_like(sbinary)
+    combined_binary[(r_binary == 1) | (sbinary == 1) | (s_binary == 1) | (b_binary == 1) | (g_binary == 1)] = 1
+    combined_binary255[(r_binary == 1) | (sbinary == 1) | (s_binary == 1) | (b_binary == 1) | (g_binary == 1)] = 255
+
+    return combined_binary, combined_binary255
+
+def transform_image(img, offset=250):
+    """원근 변환을 통해 이미지를 버드아이 뷰로 변환"""
+    img_size = (img.shape[1], img.shape[0])
+    
+    # 기본 변환 좌표 설정 (시뮬레이션용)
+    leftupper = (270, 250)
+    rightupper = (350, 250)
+    leftlower = (-300, img.shape[0])
+    rightlower = (940, img.shape[0])
+
+    warped_leftupper = (offset, 0)
+    warped_rightupper = (offset, img.shape[0])
+    warped_leftlower = (img.shape[1] - offset, 0)
+    warped_rightlower = (img.shape[1] - offset, img.shape[0])
+
+    src = np.float32([leftupper, leftlower, rightupper, rightlower])
+    dst = np.float32([warped_leftupper, warped_rightupper, warped_leftlower, warped_rightlower])
+
+    # 변환 행렬 계산
+    M = cv2.getPerspectiveTransform(src, dst)
+    
+    # 이미지 워핑
+    warped = cv2.warpPerspective(img, M, img_size, flags=cv2.WARP_FILL_OUTLIERS + cv2.INTER_CUBIC)
+    
+    return warped, M
+
+def find_lanes(binary_warped, nwindows=15, margin=30, minpix=50):
+    """슬라이딩 윈도우 방식으로 차선 픽셀 검출"""
+    # 이미지 아래쪽 절반의 히스토그램 계산
+    histogram = np.sum(binary_warped[binary_warped.shape[0] // 2:, :], axis=0)
+    
+    # 시각화를 위한 출력 이미지 생성
+    out_img = np.dstack((binary_warped, binary_warped, binary_warped)) * 255
+    
+    # 히스토그램의 왼쪽과 오른쪽 절반에서 피크 찾기
+    midpoint = int(histogram.shape[0] // 2)
+    leftx_base = np.argmax(histogram[:midpoint])
+    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+    
+    # 윈도우 높이 설정
+    window_height = int(binary_warped.shape[0] // nwindows)
+    
+    # 이미지에서 0이 아닌 모든 픽셀의 위치 식별
+    nonzero = binary_warped.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+    
+    # 각 윈도우의 현재 위치 초기화
+    leftx_current = leftx_base
+    rightx_current = rightx_base
+    
+    # 왼쪽 및 오른쪽 차선 픽셀 인덱스를 저장할 빈 리스트 생성
+    left_lane_inds = []
+    right_lane_inds = []
+    
+    # 윈도우를 하나씩 처리
+    for window in range(nwindows):
+        # 윈도우의 y 경계 식별
+        win_y_low = binary_warped.shape[0] - (window + 1) * window_height
+        win_y_high = binary_warped.shape[0] - window * window_height
         
-        output = p_control + self.i_control + d_control
-        self.prev_error = error
-
-        return output
-
-    def pid_1(self, target_vel, current_vel):
-        error = target_vel - current_vel
-
-        p_control = self.p_gain * error
-        self.i_control += self.i_gain * error * self.controlTime
-        d_control = self.d_gain * (error - self.prev_error) / self.controlTime
-
-        output = p_control + self.i_control + d_control
-        self.prev_error = error
-        return output
-
-class LaneDetectionThread(QThread):
-    signal = pyqtSignal(QImage)
-
-    def __init__(self, qt):
-        super(LaneDetectionThread, self).__init__(parent=qt)
-        print('초기화 시작')
+        # 윈도우의 x 경계 식별
+        win_xleft_low = leftx_current - margin
+        win_xleft_high = leftx_current + margin
+        win_xright_low = rightx_current - margin
+        win_xright_high = rightx_current + margin
         
-        # ROS 노드 초기화
-        rospy.init_node('LaneDetection_Ctrl')
+        # 시각화 이미지에 윈도우 그리기
+        cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (255, 0, 0), 2)
+        cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 0, 255), 2)
         
-        # 변수 초기화
-        self.prevTime = 0
-        self.selecting_sub_image = "compressed"  # compressed 또는 raw
-        self.isSim = True
-        self.wrapCaliDone = False
-        self.current_steering = 0
-        self.steering_angle_deg = 0
+        # 윈도우 내의 0이 아닌 픽셀 식별
+        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                        (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
+        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+                        (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
         
-        # ROS 퍼블리셔 설정
-        self.ctrl_pub = rospy.Publisher('/ctrl_cmd', CtrlCmd, queue_size=1)
-        self.angle_pub = rospy.Publisher("/steering_angle", Float32, queue_size=1)
-        self.width_pub = rospy.Publisher("/width_flag", Bool, queue_size=1)
+        # 인덱스를 리스트에 추가
+        left_lane_inds.append(good_left_inds)
+        right_lane_inds.append(good_right_inds)
         
-        # PID 컨트롤러 초기화
-        self.pid = pidController(p=9, i=0.1, d=2.0, rate=30)
+        # 최소 픽셀 수보다 많은 픽셀을 찾았으면 다음 윈도우 중심 위치 업데이트
+        if len(good_left_inds) > minpix:
+            leftx_current = int(np.mean(nonzerox[good_left_inds]))
+        if len(good_right_inds) > minpix:
+            rightx_current = int(np.mean(nonzerox[good_right_inds]))
+    
+    # 인덱스 배열 연결
+    try:
+        left_lane_inds = np.concatenate(left_lane_inds)
+        right_lane_inds = np.concatenate(right_lane_inds)
+    except ValueError:
+        # 구현이 완전하지 않은 경우 오류 방지
+        pass
+    
+    # 왼쪽 및 오른쪽 라인 픽셀 위치 추출
+    leftx = nonzerox[left_lane_inds]
+    lefty = nonzeroy[left_lane_inds]
+    rightx = nonzerox[right_lane_inds]
+    righty = nonzeroy[right_lane_inds]
+    
+    # 2차 다항식 피팅
+    left_fit = np.array([0, 0, 0]) if lefty.size == 0 and leftx.size == 0 else np.polyfit(lefty, leftx, 2)
+    right_fit = np.array([0, 0, 0]) if rightx.size == 0 and righty.size == 0 else np.polyfit(righty, rightx, 2)
+    
+    # 플롯팅을 위한 x, y 값 생성
+    ploty = np.linspace(0, binary_warped.shape[0] - 1, binary_warped.shape[0])
+    try:
+        left_fitx = left_fit[0] * ploty ** 2 + left_fit[1] * ploty + left_fit[2]
+        right_fitx = right_fit[0] * ploty ** 2 + right_fit[1] * ploty + right_fit[2]
+    except TypeError:
+        left_fitx = 1 * ploty ** 2 + 1 * ploty
+        right_fitx = 1 * ploty ** 2 + 1 * ploty
+    
+    # 왼쪽 및 오른쪽 차선 영역에 색상 표시
+    out_img[lefty, leftx] = [255, 0, 0]
+    out_img[righty, rightx] = [0, 255, 0]
+    
+    # 피팅된 다항식 시각화
+    for y, _ in enumerate(left_fitx):
+        left_val = min(max(int(left_fitx[y]), 0), out_img.shape[1]-1)
+        right_val = min(max(int(right_fitx[y]), 0), out_img.shape[1]-1)
+        out_img[y, left_val] = [255, 234, 0]
+        out_img[y, right_val] = [255, 234, 0]
+    
+    return out_img, left_fit, right_fit, left_fitx, right_fitx
+
+def process_frame(frame):
+    """프레임을 처리하여 차선 검출"""
+    # 이미지 이진화
+    binary, binary255 = get_bin_img(frame)
+    
+    # 원근 변환
+    warped, M = transform_image(binary)
+    
+    # 차선 검출
+    lane_img, left_fit, right_fit, left_fitx, right_fitx = find_lanes(warped)
+    
+    # 차선 검출 이미지만 반환
+    return lane_img
+    
+
+    # # 결과 이미지 합치기 (원본, 이진화, 차선 검출)
+    # h, w = frame.shape[:2]
+    
+    # # 이미지 크기 조정 (원본 프레임)
+    # frame_resized = cv2.resize(frame, (w//2, h//2))
+    
+    # # 이진화 이미지 크기 조정 및 3채널로 변환
+    # binary255_resized = cv2.resize(binary255, (w//2, h//2))
+    # binary255_colored = np.dstack((binary255_resized, binary255_resized, binary255_resized))
+    
+    # # 차선 검출 이미지 크기 조정
+    # lane_img_resized = cv2.resize(lane_img, (w//2, h//2))
+    
+    # # 이미지 합치기
+    # top_row = np.hstack((frame_resized, binary255_colored))
+    # bottom_row = np.hstack((lane_img_resized, np.zeros_like(frame_resized)))  # 빈 공간으로 채움
+    
+    # result = np.vstack((top_row, bottom_row))
+    
+    # # 각 창에 레이블 추가
+    # cv2.putText(result, "Original", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    # cv2.putText(result, "Binary", (w//2 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    # cv2.putText(result, "Lane Detection", (10, h//2 + 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    
+    # return result
+
+def main():
+    input_path = 'input/1.mp4'
+    
+    video_name = os.path.basename(input_path).split('.')[0]
+    
+    output_base = 'output'
+    output_dir = os.path.join(output_base, video_name)
+    
+    folder_counter = 0
+    while os.path.exists(output_dir):
+        folder_counter += 1
+        output_dir = os.path.join(output_base, f"{video_name}_{folder_counter}")
+
+    if not os.path.exists(output_base):
+        os.makedirs(output_base)
         
-        # 조향각 구독
-        self.steering_sub = rospy.Subscriber('/steering_angle', Float32, self.steering_callback, queue_size=1)
+    os.makedirs(output_dir)
+
+    cap = cv2.VideoCapture(input_path)
+    
+    if not cap.isOpened():
+        print("Can't open the video.")
+        return
+    
+    index = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Video end or error occurred.")
+            break
         
-        # 이미지 구독 설정
-        if self.selecting_sub_image == "compressed":
-            if self.isSim:
-                self._sub = rospy.Subscriber('/image_jpeg/compressed', CompressedImage, self.callback, queue_size=1)
-            else:
-                self._sub = rospy.Subscriber('/usb_cam/image_raw', Image, self.callback, queue_size=1)
-                self._sub = rospy.Subscriber('/zed2/zed_node/left/image_rect_color/compressed', CompressedImage, self.callback, queue_size=1)
-        else:
-            self._sub = rospy.Subscriber('/usb_cam/image_raw', Image, self.callback, queue_size=1)
-
-        # 브릿지 및 차선 검출기 초기화
-        self.bridge = CvBridge()
-        self.lane_detector = LaneDetection()
+        result = process_frame(frame)
         
-        print('초기화 완료')
-
-    def doWrapCalibration(self, cv_image):
-        """원근 변환을 위한 캘리브레이션 수행"""
-        if self.isSim:
-            offset = 250
-            leftupper = (270, 250)
-            rightupper = (350, 250)
-            leftlower = (-300, cv_image.shape[0])
-            rightlower = (940, cv_image.shape[0])
-
-            warped_leftupper = (offset, 0)
-            warped_rightupper = (offset, cv_image.shape[0])
-            warped_leftlower = (cv_image.shape[1] - offset, 0)
-            warped_rightlower = (cv_image.shape[1] - offset, cv_image.shape[0])
-        else:
-            offset = 250
-            leftupper = (265, 160)
-            rightupper = (395, 160)
-            leftlower = (-135, cv_image.shape[0])
-            rightlower = (795, cv_image.shape[0])
-
-            warped_leftupper = (offset, 0)
-            warped_rightupper = (offset, cv_image.shape[0])
-            warped_leftlower = (cv_image.shape[1] - offset, 0)
-            warped_rightlower = (cv_image.shape[1] - offset, cv_image.shape[0])
-
-        return (np.float32([leftupper, leftlower, rightupper, rightlower]),
-                np.float32([warped_leftupper, warped_rightupper, warped_leftlower, warped_rightlower]))
-
-    def steering_callback(self, msg):
-        """조향각 콜백 함수"""
-        self.current_steering = msg.data
-
-    def callback(self, image_msg):
-        """이미지 콜백 함수"""
-        try:
-            # 이미지 변환
-            if self.selecting_sub_image == "compressed":
-                np_arr = np.frombuffer(image_msg.data, np.uint8)
-                cv_image = cv2.imdecode(np_arr, cv2.COLOR_BGR2RGB)
-                cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-            elif self.selecting_sub_image == "raw":
-                cv_image = self.bridge.imgmsg_to_cv2(image_msg, "bgr8")
-
-            # 원근 변환 설정
-            if self.wrapCaliDone is False:
-                wrap_origin, wrap = self.doWrapCalibration(cv_image)
-                self.lane_detector.set_perspective_transform(wrap_origin, wrap)
-                self.wrapCaliDone = True
-
-            # 차선 검출 처리
-            result = self.lane_detector.process_image(cv_image)
-            
-            # 차선 정보 추출
-            left_fit = result['left_fit']
-            right_fit = result['right_fit']
-            left_fitx = result['left_fitx']
-            right_fitx = result['right_fitx']
-            lane_img = result['lane_image']
-            
-            # 픽셀 당 미터 단위 설정
-            xmtr_per_pixel = 6.7 / 400
-            
-            # 차량 위치 및 조향각 계산
-            center_dist, steering_angle_deg = self.calculate_vehicle_position(
-                cv_image, left_fit, right_fit, left_fitx, right_fitx, xmtr_per_pixel
-            )
-            
-            # 조향각 설정 및 발행
-            if steering_angle_deg is not None:
-                self.steering_angle_deg = steering_angle_deg
-                msg = Float32()
-                msg.data = steering_angle_deg
-                self.angle_pub.publish(msg)
-                print(f"조향각: {steering_angle_deg:.2f}")
-                print("==================================")
-
-            # 차량 제어
-            self.control_unit(center_dist)
-
-            # FPS 계산
-            h, w, ch = lane_img.shape
-            curTime = time.time()
-            sec = curTime - self.prevTime
-            self.prevTime = curTime
-            fps = 1 / (sec)
-            tstamp = float(image_msg.header.stamp.to_sec())
-            
-            # FPS 표시
-            cv2.putText(lane_img, f"FPS: {fps:.1f} {tstamp:.3f}", (w-300, 50),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255))
-
-            # 이미지 변환 및 표시
-            convertToQtFormat = QImage(lane_img.data, w, h, lane_img.strides[0], QImage.Format_RGB888)
-            p = convertToQtFormat.scaled(640, 480, Qt.KeepAspectRatio)
-            self.signal.emit(p)
-            
-        except Exception as e:
-            print(f"오류 발생: {e}")
-
-    def run(self):
-        """스레드 실행 함수"""
-        rospy.spin()
-
-    def calculate_vehicle_position(self, image, left_fit, right_fit, left_fitx, right_fitx, xmtr_per_pixel):
-        """차량 위치와 조향각 계산"""
-        # 차선 폭 계산
-        lane_width_px = right_fitx[-1] - left_fitx[-1]
+        cv2.imshow('Lane Detection', result)
         
-        # 차선 폭이 너무 넓으면 무시
-        if lane_width_px > 180:
-            msg = Bool()
-            msg.data = False
-            self.width_pub.publish(msg)
-            return 0, None
-        else:
-            msg = Bool()
-            msg.data = True
-            self.width_pub.publish(msg)
+        cv2.imwrite(f'{output_dir}/frame_{index:04d}.jpg', result)
+        index += 1
         
-        # 차선 중앙과 이미지 중앙 간의 오프셋 계산
-        lane_center_px = (right_fitx[-1] + left_fitx[-1]) / 2
-        image_center_px = image.shape[1] / 2
-        center_offset_px = image_center_px - lane_center_px
-        center_offset_m = center_offset_px * xmtr_per_pixel
-        
-        print(f"차량 위치: {abs(center_offset_m):.2f} m")
-        
-        # 조향각 계산
-        vehicle_length = 1.4  # meter
-        steering_angle_rad = math.atan(center_offset_m / vehicle_length)
-        steering_angle_deg = max(min(float(math.degrees(steering_angle_rad)), 24), -24)
-        steering_angle_deg = (float(steering_angle_deg * 14) / 24)
-        
-        return center_offset_m, steering_angle_deg
+        # 'q' 키를 누르면 종료
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    print(f"Total {index} frames have been saved to {output_dir}")
+    
+    # 자원 해제
+    cap.release()
+    cv2.destroyAllWindows()
 
-    def control_unit(self, center_dist):
-        """차량 제어 명령 생성"""
-        # 조향각 변환
-        if self.current_steering == 0:
-            self.current_steering = 0
-        else:
-            self.current_steering = (self.current_steering * 0.097) / 24
-
-        # 제어 명령 생성 및 발행
-        send = CtrlCmd()
-        send.velocity = 1.5  # km/h
-        send.accel = 0.521
-        send.steering = self.current_steering
-        self.ctrl_pub.publish(send)
-
-class App(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.title = '차선 검출 및 자율주행'
-        self.left = 100
-        self.top = 100
-        self.width = 640
-        self.height = 480
-        self.initUI()
-
-    @pyqtSlot(QImage)
-    def setImage(self, image):
-        """이미지 업데이트 함수"""
-        self.label.setPixmap(QPixmap.fromImage(image))
-
-    def initUI(self):
-        """UI 초기화"""
-        self.setWindowTitle(self.title)
-        self.setGeometry(self.left, self.top, self.width, self.height)
-        
-        # 라벨 생성
-        self.label = QLabel(self)
-        self.label.resize(self.width, self.height)
-        self.setCentralWidget(self.label)
-
-        self.show()
-        
-        # 스레드 시작
-        self.thread = LaneDetectionThread(self)
-        self.thread.signal.connect(self.setImage)
-        self.thread.start()
-
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    ex = App()
-    sys.exit(app.exec_()) 
+if __name__ == "__main__":
+    main() 
